@@ -1,0 +1,29 @@
+[project]
+name = "crypto-engine"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "BLeopaul",email = "bussacleopaul@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "cryptography (>=49.0.0,<50.0.0)",
+    "aiobotocore (>=3.7.0,<4.0.0)",
+    "tenacity (>=9.1.4,<10.0.0)"
+]
+
+[tool.poetry]
+packages = [{include = "crypto_engine", from = "src"}]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "pytest (>=9.1.0,<10.0.0)",
+    "pytest-asyncio (>=1.4.0,<2.0.0)",
+    "ruff (>=0.15.17,<0.16.0)",
+    "mypy (>=2.1.0,<3.0.0)"
+]
