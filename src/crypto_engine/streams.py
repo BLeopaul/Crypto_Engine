@@ -70,6 +70,10 @@ async def _readexactly_into(reader: AsyncReader, view: memoryview) -> int:
 # Magic Number (b'ENV1' 4s), Chunk Size (I 4b), Base Nonce (12s 12b), EDK Length (I 4b)
 HEADER_STRUCT = struct.Struct("!4s I 12s I")
 
+# NIST SP 800-38D Safety Cap: Maximum blocks under one AES-GCM DEK/Nonce context.
+# We limit to 65536 chunks (~64 GB with 1MB blocks) to enforce strict cryptographic boundaries.
+MAX_CHUNKS_PER_DEK = 65536
+
 async def encrypt_stream(
     reader: AsyncReader,
     kms: AbstractKMSProvider,
@@ -97,6 +101,8 @@ async def encrypt_stream(
     try:
         chunk_idx = 0
         while True:
+            if chunk_idx >= MAX_CHUNKS_PER_DEK:
+                raise ValueError("NIST SP 800-38D Safety Cap: Maximum data per DEK exceeded.")
             bytes_read = await _readexactly_into(reader, view)
             
             is_last = (bytes_read < chunk_size)
