@@ -4,7 +4,8 @@ import typing
 import asyncio
 from typing import AsyncGenerator, Protocol, Union
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
 from tenacity import AsyncRetrying, wait_exponential_jitter, stop_after_attempt
 
 from .kms import AbstractKMSProvider, EncryptionContext
@@ -13,7 +14,6 @@ from .utils import wipe_memory
 class AsyncReader(Protocol):
     """
     Protocol for non-blocking I/O reading directly into mutable buffers.
-    Compatible with aiofiles or custom async wrappers around streams.
     """
     async def readinto(self, buffer: Union[bytearray, memoryview]) -> int: ...
 
@@ -22,6 +22,39 @@ class AsyncWriter(Protocol):
     Protocol for non-blocking I/O writing.
     """
     async def write(self, data: bytes) -> int: ...
+
+class ResilientAsyncReaderAdapter(AsyncReader):
+    """
+    Axe 3: Symetric Network Resilience.
+    Wraps a stream connection factory to survive intermittent network drops during reading.
+    It transparently reconnects at the correct byte offset if readinto() fails.
+    """
+    def __init__(self, reader_factory: typing.Callable[[int], typing.Awaitable[AsyncReader]]):
+        self.reader_factory = reader_factory
+        self.offset = 0
+        self.current_reader: typing.Optional[AsyncReader] = None
+
+    async def _get_reader(self) -> AsyncReader:
+        if self.current_reader is None:
+            self.current_reader = await self.reader_factory(self.offset)
+        return self.current_reader
+
+    async def readinto(self, buffer: Union[bytearray, memoryview]) -> int:
+        async for attempt in AsyncRetrying(
+            wait=wait_exponential_jitter(initial=1, max=10),
+            stop=stop_after_attempt(5),
+            reraise=True
+        ):
+            with attempt:
+                try:
+                    reader = await self._get_reader()
+                    bytes_read = await reader.readinto(buffer)
+                    self.offset += bytes_read
+                    return bytes_read
+                except Exception as e:
+                    self.current_reader = None  # Force reconnect on next attempt
+                    raise e
+
 
 async def _readexactly_into(reader: AsyncReader, view: memoryview) -> int:
     """Helper to fill the memoryview exactly or stop at EOF without allocating new bytes."""
@@ -41,11 +74,12 @@ async def encrypt_stream(
     reader: AsyncReader,
     kms: AbstractKMSProvider,
     context: EncryptionContext,
-    chunk_size: int = 1024 * 1024  # 1MB blocks to optimize CPU/RAM
-) -> AsyncGenerator[bytes, None]:
+    chunk_size: int = 1024 * 1024  # 1MB blocks
+) -> AsyncGenerator[bytearray, None]:
     """
     High-concurrency streaming encryptor using Envelope Encryption.
-    Yields the dynamic header followed by AES-GCM encrypted chunks.
+    Axe 1 & 2: Uses Cipher/update_into for zero-copy mutable bytearray allocation
+    and synchronous execution relying on OpenSSL GIL release.
     """
     if not context:
         raise ValueError("EncryptionContext is strictly required.")
@@ -55,15 +89,11 @@ async def encrypt_stream(
     
     header_fixed = HEADER_STRUCT.pack(b'ENV1', chunk_size, base_nonce, len(edk))
     binary_header = header_fixed + edk
-    yield binary_header
+    yield bytearray(binary_header)
 
     buffer = bytearray(chunk_size)
     view = memoryview(buffer)
-    aesgcm = AESGCM(pt_dek)
     
-    # WARNING: boto3 outputs immutable bytes. The downstream consumer must handle the yielded plaintext lifecycle.
-    del pt_dek
-
     try:
         chunk_idx = 0
         while True:
@@ -74,19 +104,31 @@ async def encrypt_stream(
             
             nonce_int = int.from_bytes(base_nonce, 'big') ^ chunk_idx
             block_nonce = nonce_int.to_bytes(12, 'big')
-            
             aad = binary_header + struct.pack("!?I", is_last, chunk_idx)
             
-            encrypted_chunk = await asyncio.to_thread(aesgcm.encrypt, block_nonce, bytes(data_view), aad)
+            # Axe 1: Zero-copy low-level encryption using OpenSSL bindings
+            # The GIL is implicitly released during update_into() by cryptography.
+            cipher = Cipher(algorithms.AES(pt_dek), modes.GCM(block_nonce), backend=default_backend())
+            encryptor = cipher.encryptor()
+            encryptor.authenticate_additional_data(aad)
+            
+            out_buf = bytearray(bytes_read + 16)
+            out_len = encryptor.update_into(data_view, out_buf)
+            encryptor.finalize()
+            out_buf[out_len:out_len+16] = encryptor.tag
             
             wipe_memory(buffer)
-            yield encrypted_chunk
+            yield out_buf
             
             if is_last:
                 break
             chunk_idx += 1
     finally:
         wipe_memory(buffer)
+        # Attempt to wipe the plaintext key, though limited if returned as immutable bytes from KMS.
+        if isinstance(pt_dek, bytearray):
+            wipe_memory(pt_dek)
+        del pt_dek
         del view
         del buffer
 
@@ -95,10 +137,10 @@ async def decrypt_stream(
     reader: AsyncReader,
     kms: AbstractKMSProvider,
     context: EncryptionContext
-) -> AsyncGenerator[bytes, None]:
+) -> AsyncGenerator[bytearray, None]:
     """
     High-concurrency streaming decryptor.
-    Reads binary header, decrypts DEK, and yields processed plaintext chunks.
+    Axe 1 & 2: Uses Cipher/update_into for zero-copy mutable bytearray allocation.
     """
     if not context:
         raise ValueError("EncryptionContext is strictly required.")
@@ -108,6 +150,7 @@ async def decrypt_stream(
     fixed_view = memoryview(fixed_header_buf)
     
     edk_buf: bytearray = bytearray()
+    pt_dek: typing.Union[bytes, bytearray] = b""
     
     try:
         read_bytes = await _readexactly_into(reader, fixed_view)
@@ -127,9 +170,6 @@ async def decrypt_stream(
         binary_header = bytes(fixed_header_buf) + bytes(edk_buf)
         
         pt_dek = await kms.decrypt_data_key(bytes(edk_buf), context)
-        aesgcm = AESGCM(pt_dek)
-        # WARNING: boto3 outputs immutable bytes. The downstream consumer must handle the yielded plaintext lifecycle.
-        del pt_dek
         
     finally:
         wipe_memory(fixed_header_buf)
@@ -152,22 +192,32 @@ async def decrypt_stream(
             if bytes_read < 16:
                 raise ValueError("Corrupted Stream: Chunk too small to contain AES-GCM tag.")
                 
-            enc_data_view = view[:bytes_read]
+            enc_data_view = view[:bytes_read - 16]
+            tag = bytes(view[bytes_read - 16:bytes_read])
             
             nonce_int = int.from_bytes(base_nonce, 'big') ^ chunk_idx
             block_nonce = nonce_int.to_bytes(12, 'big')
-            
             aad = binary_header + struct.pack("!?I", is_last, chunk_idx)
             
-            plaintext_chunk = await asyncio.to_thread(aesgcm.decrypt, block_nonce, bytes(enc_data_view), aad)
+            # Axe 1: Zero-copy low-level decryption
+            cipher = Cipher(algorithms.AES(pt_dek), modes.GCM(block_nonce, tag), backend=default_backend())
+            decryptor = cipher.decryptor()
+            decryptor.authenticate_additional_data(aad)
             
-            # WARNING: cryptography outputs immutable bytes. The downstream consumer must handle the yielded plaintext lifecycle.
-            yield plaintext_chunk
+            out_buf = bytearray(bytes_read - 16)
+            out_len = decryptor.update_into(enc_data_view, out_buf)
+            decryptor.finalize()
+            
+            wipe_memory(buffer)
+            yield out_buf
             
             if is_last:
                 break
             chunk_idx += 1
     finally:
+        if isinstance(pt_dek, bytearray):
+            wipe_memory(pt_dek)
+        del pt_dek
         del view
         del buffer
 
@@ -180,11 +230,9 @@ async def pipe_decrypted_stream(
 ) -> None:
     """
     Consumes the decrypt_stream generator and writes plaintext directly to a writer.
-    Ensures memory is minimized by not retaining plaintext references longer than necessary.
-    Includes explicit Exponential Backoff to tolerate partial I/O failures (e.g. S3 drops).
+    Ensures memory is wiped precisely after I/O finishes.
     """
     async for plaintext_chunk in decrypt_stream(reader, kms, context):
-        # Fault Tolerance: Re-attempt writing the exact same chunk to survive intermittent network drops
         async for attempt in AsyncRetrying(
             wait=wait_exponential_jitter(initial=1, max=10),
             stop=stop_after_attempt(5),
@@ -193,5 +241,6 @@ async def pipe_decrypted_stream(
             with attempt:
                 await writer.write(plaintext_chunk)
                 
-        # Force garbage collector cleanup of immutable plaintext buffer
+        # Axe 1: The plaintext_chunk is a mutable bytearray, so we can securely wipe it!
+        wipe_memory(plaintext_chunk)
         del plaintext_chunk

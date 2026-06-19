@@ -8,7 +8,7 @@ Built with stringent security requirements, this module utilizes Envelope Encryp
 
 - **Envelope Encryption**: Generates a unique Data Encryption Key (DEK) for every processed file via a Key Management Service (KMS), mathematically bound to a specific Encryption Context.
 - **Asynchronous I/O (Non-Blocking)**: Implemented as asynchronous Python generators (`AsyncGenerator`), allowing orchestration layers to handle massive throughput (e.g., local disk, S3, network) without blocking the CPU.
-- **Best-effort Memory Hygiene**: Reduces RAM footprint by explicitly zeroing sensitive mutable I/O buffers in C-land (via `ctypes.memset`), though inherently limited by CPython's immutable `bytes` lifecycles.
+- **Best-effort memory footprint mitigation**: Reduces RAM footprint by explicitly zeroing sensitive mutable I/O buffers in C-land (via `ctypes.memset`), though inherently limited by CPython's immutable `bytes` lifecycles. Low-level Zero-Copy encryption avoids `bytes` allocation for data chunks.
 - **Indivisible Cryptographic Seal**: Uses AES-GCM. The dynamic binary header, sequence indices, and truncation flags are bound into the Additional Authenticated Data (AAD) to mathematically prevent chunk reordering, header manipulation, and perfect-truncation attacks.
 - **Network Resilience**: 
   - AWS KMS API calls are protected against `ThrottlingException` (HTTP 429) via Exponential Backoff and Jitter.
